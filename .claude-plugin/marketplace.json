@@ -1,0 +1,13 @@
+{
+  "name": "vcu-ai-news",
+  "owner": { "name": "kuntae802" },
+  "description": "AI 도구 소식(Claude Code · Codex 릴리스, Anthropic · OpenAI 뉴스)을 한국어로 정리하는 플러그인 배포 채널.",
+  "plugins": [
+    {
+      "name": "ai-news-digest",
+      "source": "./plugin/ai-news-digest",
+      "description": "Claude Code · Codex 릴리스와 Anthropic · OpenAI 뉴스를 가져와 새로 나온 것 · 바뀐 것 · 고친 것 · 곧 바뀌거나 없어질 것 · 그 밖 소식으로 나눠 한국어로 정리합니다. 대화창이나 파일로 받습니다.",
+      "category": "productivity"
+    }
+  ]
+}

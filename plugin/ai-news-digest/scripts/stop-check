@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Stop 훅 진입점 — report 스킬을 부른 대화가 끝나려 할 때 결과 파일을 검사한다.
+
+플러그인 hooks/hooks.json에 걸려 있다. 인자 1개 = 데이터 폴더(훅 명령 줄의 ${CLAUDE_PLUGIN_DATA}).
+스킬 프런트매터 훅에서는 ${CLAUDE_PLUGIN_DATA}를 쓸 수 없어(플러그인 훅 전용 — 실측) 이 자리에 둔다.
+표준 입력 = Claude Code가 주는 훅 JSON(session_id · stop_hook_active를 읽는다).
+대기 표시는 대화마다 따로: <데이터 폴더>/pending/<세션 ID>.json
+
+    이 대화의 대기 표시 없음 · 세션 ID 없음        → 0 (다른 대화에 끼어들지 않음)
+    대기 표시를 만든 지 2시간이 넘음               → 0 (오래된 것은 무시)
+    검사 통과(--commit으로 기록 확정)              → 0
+    검사 실패                                      → 이유를 stderr에, 2 (Claude가 고쳐서 다시 끝냄)
+    검사 실패인데 stop_hook_active=true            → 대기 표시를 <세션 ID>.abandoned.json으로 바꾸고 0
+                                                     (무한 반복 막기 · 다음 턴에 또 막지 않기 — 기록은 안 바뀜)
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+CHECK = Path(__file__).resolve().parent.parent / "bin" / "ai-news-check"
+SESSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+MAX_AGE = timedelta(hours=2)
+
+
+def read_hook_input() -> dict:
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
+        raw = sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else {}
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def too_old(created_at, now: datetime) -> bool:
+    try:
+        made = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+    except ValueError:
+        return False  # 시각을 못 읽으면 검사기에 맡긴다
+    if made.tzinfo is None:
+        made = made.replace(tzinfo=timezone.utc)
+    return now - made > MAX_AGE
+
+
+def main(argv, now: datetime | None = None) -> int:
+    hook = read_hook_input()
+    if len(argv) < 2 or not argv[1].strip():
+        print("stop-check: 데이터 폴더 인자가 없어 검사를 건너뜁니다.", file=sys.stderr)
+        return 0
+    session = str(hook.get("session_id") or "").strip()
+    if not SESSION_RE.match(session):
+        return 0
+    data_dir = Path(argv[1]).expanduser()
+    pending_path = data_dir / "pending" / f"{session}.json"
+    if not pending_path.exists():
+        return 0
+    try:
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pending = {}
+    if not isinstance(pending, dict) or not str(pending.get("session_id") or "").strip():
+        return 0  # 누구 것인지 모르는 대기 표시는 검사하지 않는다
+    if too_old(pending.get("created_at"), now or datetime.now(timezone.utc)):
+        return 0
+
+    active = hook.get("stop_hook_active") is True or str(hook.get("stop_hook_active")).lower() == "true"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(CHECK), "--data-dir", str(data_dir), "--session-id", session, "--commit"],
+            capture_output=True, text=True, timeout=120,
+        )
+        code, reason = proc.returncode, (proc.stderr or proc.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        code, reason = 1, f"검사기를 실행하지 못했습니다: {e}"
+
+    if code == 0:
+        return 0
+    if active:
+        # 이미 한 번 막아 고칠 기회를 줬다. 여기서 또 막으면 끝없이 돈다.
+        # 대기 표시는 포기 표시로 바꿔 다음 턴에 다시 막지 않게 하고, 기록(state)은 그대로 둔다.
+        try:
+            os.replace(pending_path, pending_path.with_name(f"{session}.abandoned.json"))
+        except OSError:
+            pass
+        print("stop-check: 다시 검사해도 실패 — 멈춤은 막지 않고 이 리포트를 포기 표시로 남깁니다.\n" + reason,
+              file=sys.stderr)
+        return 0
+    print(reason + "\n\n위 이유대로 결과 파일을 고친 뒤(Edit) 다시 끝내세요. "
+          "보기 파일에 적힌 source · id · title · link · date와 errors는 바꾸지 말고 그대로 옮깁니다.",
+          file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

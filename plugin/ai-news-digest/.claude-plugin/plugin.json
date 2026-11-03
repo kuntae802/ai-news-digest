@@ -1,0 +1,10 @@
+{
+  "name": "ai-news-digest",
+  "version": "0.1.0",
+  "description": "Claude Code · Codex 릴리스와 Anthropic · OpenAI 뉴스를 가져와 새로 나온 것 · 바뀐 것 · 고친 것 · 곧 바뀌거나 없어질 것 · 그 밖 소식으로 나눠 한국어로 요약합니다.",
+  "author": {
+    "name": "kuntae802"
+  },
+  "homepage": "https://github.com/kuntae802/ai-news-digest",
+  "repository": "https://github.com/kuntae802/ai-news-digest"
+}

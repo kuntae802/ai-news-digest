@@ -1,0 +1,15 @@
+{
+  "description": "report 스킬이 쓴 결과 파일을 대화가 끝날 때 검사하고, 통과하면 기록을 갱신한다. 대기 중인 리포트가 없거나 다른 대화의 것이면 바로 통과한다.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/stop-check\" \"${CLAUDE_PLUGIN_DATA}\""
+          }
+        ]
+      }
+    ]
+  }
+}
