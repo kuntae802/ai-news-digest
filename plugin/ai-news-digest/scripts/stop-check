@@ -10,7 +10,7 @@
     대기 표시를 만든 지 2시간이 넘음               → 0 (오래된 것은 무시)
     검사 통과(--commit으로 기록 확정)              → 0
     검사 실패                                      → 이유를 stderr에, 2 (Claude가 고쳐서 다시 끝냄)
-    검사 실패인데 stop_hook_active=true            → 대기 표시를 <세션 ID>.abandoned.json으로 바꾸고 0
+    검사 실패인데 stop_hook_active=true            → --partial로 통과한 항목만 확정하고 0, 그것도 안 되면 대기 표시를 <세션 ID>.abandoned.json으로 바꾸고 0
                                                      (무한 반복 막기 · 다음 턴에 또 막지 않기 — 기록은 안 바뀜)
 """
 from __future__ import annotations
@@ -83,6 +83,18 @@ def main(argv, now: datetime | None = None) -> int:
     if code == 0:
         return 0
     if active:
+        # 두 번째 실패 — 통과한 항목만 확정하고 걸린 항목은 따로 둔다(3번 걸리면 건너뜀)
+        try:
+            p2 = subprocess.run(
+                [sys.executable, str(CHECK), "--data-dir", str(data_dir), "--session-id", session,
+                 "--commit", "--partial"], capture_output=True, text=True, timeout=120)
+            if p2.returncode == 0:
+                print("stop-check: 일부만 확정 — 걸린 소식은 빼고 나머지를 기록했습니다.\n"
+                      + (p2.stdout or "").strip(), file=sys.stderr)
+                return 0
+            reason = (p2.stderr or p2.stdout or reason).strip()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
         # 이미 한 번 막아 고칠 기회를 줬다. 여기서 또 막으면 끝없이 돈다.
         # 대기 표시는 포기 표시로 바꿔 다음 턴에 다시 막지 않게 하고, 기록(state)은 그대로 둔다.
         try:

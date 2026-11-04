@@ -8,7 +8,9 @@
         → state.json 갱신 → 대기 표시 삭제 → 임시 작업 폴더 치우기.
         대기 표시가 없으면 "검사할 것 없음"으로 0.
     ai-news-check --result FILE --fetched FILE
-        기록은 건드리지 않고 검사만 한다(서버가 claude -p 뒤에 한 번 더 돌릴 때).
+        기록은 건드리지 않고 검사만 한다(서버가 claude -p 뒤에 한 번 더 돌릴 때). 확정된 결과에는 검사기가
+        쓴 dropped가 있을 수 있어 이 모양에서만 dropped를 받는다 — --data-dir로 검사할 때(Claude가 쓴 결과)
+        dropped가 있으면 실패다(dropped는 --partial 확정 때 검사기만 쓴다).
 
 종료 코드: 통과 0 · 실패 1(이유는 stderr).
 파이썬 표준 라이브러리만 쓴다.
@@ -16,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -55,20 +58,186 @@ def _label(src, iid, title=None) -> str:
     return f"[{src}] {iid}{t}"
 
 
-def validate(result, fetched) -> list[str]:
-    """설계 5.4의 통과 조건. 문제 목록(비었으면 통과)."""
+HEADLINE_MAX, LEAD_MAX, CHANGE_MAX, PER_KIND_MAX = 60, 200, 120, 3
+COUNT_WORD_RE = re.compile(r"\d+\s*(?:건|개)")
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+MONTHS = ("January", "February", "March", "April", "May", "June", "July",
+          "August", "September", "October", "November", "December")
+
+
+def _blank(v) -> bool:
+    """없음 · None · 공백뿐인 글 · 빈 목록."""
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return not v.strip()
+    if isinstance(v, (list, dict)):
+        return not v
+    return False
+
+
+def _date_forms(iso: str) -> list[str]:
+    """YYYY-MM-DD를 원문에 쓰이는 꼴들로: 2026-11-30 · November 30, 2026 · Nov 30, 2026 · 30 November 2026."""
+    y, m, d = (int(x) for x in iso.split("-"))
+    full = MONTHS[m - 1]
+    return [iso, f"{full} {d}, {y}", f"{full[:3]} {d}, {y}", f"{d} {full} {y}"]
+
+
+def _source_text(src: dict) -> str:
+    parts = [src.get("body") if isinstance(src.get("body"), str) else ""]
+    for ln in src.get("lines") or []:
+        if isinstance(ln, dict) and isinstance(ln.get("text"), str):
+            parts.append(ln["text"])
+    return "\n".join(parts)
+
+
+def check_item(it: dict, src: dict, depth: str) -> list[str]:
+    """결과 항목 하나를 가져온 항목(src)과 맞춰 본다. 문제 문장 목록(비었으면 통과)."""
     problems: list[str] = []
+    name = _label(it.get("source"), it.get("id"))
+    kind = src.get("body_kind")
+    if it.get("link") != src.get("link"):
+        problems.append(f"링크 다름: {name}의 link가 가져온 값과 다릅니다 "
+                        f"(결과 {it.get('link')!r} / 가져온 것 {src.get('link')!r}).")
+    for field in ("title", "date"):
+        if field not in it:
+            problems.append(f"{field} 없음: {name}에 {field} 칸이 없습니다 — 가져온 값을 그대로 넣으세요.")
+        elif it[field] != src.get(field):
+            problems.append(f"{field} 다름: {name}의 {field}가 가져온 값과 다릅니다 "
+                            f"(결과 {it[field]!r} / 가져온 것 {src.get(field)!r}).")
+    if it.get("category") not in CATEGORIES:
+        problems.append(f"칸 틀림: {name}의 category가 {it.get('category')!r}입니다 "
+                        f"({' · '.join(CATEGORIES)} 중 하나).")
+
+    # 헤드라인 · 핵심 한 줄
+    for field, limit in (("headline", HEADLINE_MAX), ("lead", LEAD_MAX)):
+        v = it.get(field)
+        if not isinstance(v, str) or not v.strip():
+            problems.append(f"빈 칸: {name}의 {field}가 비어 있습니다 — 한국어로 채우세요.")
+        elif len(v.strip()) > limit:
+            problems.append(f"너무 김: {name}의 {field}가 {len(v.strip())}자입니다 — {limit}자 이하로 줄이세요.")
+    if isinstance(it.get("headline"), str) and "`" in it["headline"]:
+        problems.append(f"백틱 금지: {name}의 headline에 백틱(`)이 있습니다 — 헤드라인은 꾸밈 없는 글로 쓰세요(명령 · 플래그 이름도 백틱 없이).")
+
+    # 릴리스: 근거 줄 · 묶음당 3개 · 설명 길이
+    if kind == "release":
+        lines = {ln.get("n"): ln for ln in src.get("lines") or [] if isinstance(ln, dict)}
+        changes = it.get("changes")
+        if changes is None:
+            changes = []
+        if not isinstance(changes, list):
+            problems.append(f"changes 틀림: {name}의 changes가 배열이 아닙니다 — [{{\"ref\": 줄 번호, \"text\": 설명}}] 꼴로 쓰세요.")
+            changes = []
+        seen: set = set()
+        per_kind: dict[str, int] = {}
+        for k, ch in enumerate(changes, 1):
+            if not isinstance(ch, dict):
+                problems.append(f"changes 틀림: {name}의 changes {k}번째가 객체가 아닙니다 — {{\"ref\": 줄 번호, \"text\": 설명}} 꼴로 쓰세요.")
+                continue
+            ref, text = ch.get("ref"), ch.get("text")
+            if not isinstance(ref, int) or isinstance(ref, bool) or ref not in lines:
+                problems.append(f"ref 없음: {name}의 changes 중 ref {ref!r}은(는) 원문 줄 번호(n)에 없습니다 — 가져온 줄 번호 중에서 고르세요.")
+            else:
+                if ref in seen:
+                    problems.append(f"ref 겹침: {name}의 changes에 ref {ref}이(가) 두 번 있습니다 — 한 줄은 한 번만 쓰세요.")
+                else:
+                    seen.add(ref)
+                    lk = lines[ref].get("kind") or "other"
+                    per_kind[lk] = per_kind.get(lk, 0) + 1
+            if not isinstance(text, str) or not text.strip():
+                problems.append(f"changes text 비어 있음: {name}의 ref {ref!r} 설명이 비어 있습니다 — 한국어 한 줄을 쓰세요.")
+            elif len(text.strip()) > CHANGE_MAX:
+                problems.append(f"너무 김: {name}의 ref {ref!r} 설명이 {len(text.strip())}자입니다 — {CHANGE_MAX}자 이하로 줄이세요.")
+        for lk, n in per_kind.items():
+            if n > PER_KIND_MAX:
+                problems.append(f"묶음 초과: {name}의 changes에서 '{lk}' 묶음이 {n}개입니다 — 묶음당 {PER_KIND_MAX}개 이하로 가장 눈여겨볼 줄만 남기세요.")
+        # 항목 수는 서버가 기계 값으로 붙인다
+        texts = [("headline", it.get("headline")), ("lead", it.get("lead")), ("why", it.get("why"))]
+        texts += [("changes text", ch.get("text")) for ch in changes if isinstance(ch, dict)]
+        for field, v in texts:
+            m = COUNT_WORD_RE.search(v) if isinstance(v, str) else None
+            if m:
+                problems.append(f"숫자 금지: {name}의 {field}에 '{m.group(0)}' 꼴 수가 있습니다 — 항목 수는 서버가 붙이니 빼세요.")
+
+    # 소개문만(intro): 근거가 없는 칸은 쓰지 않는다
+    if kind == "intro":
+        for field in ("why", "background", "todo"):
+            if not _blank(it.get(field)):
+                problems.append(f"쓰면 안 됨: {name}은(는) 소개문만 읽은 소식이라 {field}를 비워야 합니다 — 근거가 없습니다.")
+
+    # 뉴스(article) 대화창: 왜 중요한가
+    if kind == "article" and depth == "detail" and _blank(it.get("why")):
+        problems.append(f"why 비어 있음: {name}은(는) depth=detail이라 why(왜 중요한가)를 써야 합니다.")
+
+    # 챙길 것
+    todo = it.get("todo")
+    if todo is not None:
+        if not isinstance(todo, list):
+            problems.append(f"todo 틀림: {name}의 todo가 배열이 아닙니다 — [{{\"who\": 누가, \"do\": 무엇을}}] 꼴로 쓰세요.")
+        else:
+            for k, t in enumerate(todo, 1):
+                if not isinstance(t, dict) or any(not isinstance(t.get(f), str) or not t[f].strip() for f in ("who", "do")):
+                    problems.append(f"todo 틀림: {name}의 todo {k}번째에 who · do가 비어 있거나 없습니다 — 둘 다 글로 채우거나 그 줄을 빼세요.")
+
+    # 마감일: 원문에 같은 날짜가 있어야 한다
+    dl = it.get("deadline")
+    if dl is not None:
+        ok = False
+        if isinstance(dl, str) and ISO_DATE_RE.match(dl):
+            try:
+                datetime.date.fromisoformat(dl)
+                ok = True
+            except ValueError:
+                pass
+        if not ok:
+            problems.append(f"deadline 꼴 틀림: {name}의 deadline {dl!r}은(는) YYYY-MM-DD가 아닙니다 — 그 꼴로 쓰거나 null로 두세요.")
+        else:
+            def found(text: str) -> bool:
+                return any(re.search(r"(?<![\w-])" + re.escape(f) + r"(?![\w-])", text, re.I) for f in _date_forms(dl))
+            if kind == "release":
+                # 릴리스: 기계가 deprecating으로 묶은 원문 줄(Deprecated · Removed …)에 적힌 날짜만
+                dep = "\n".join(ln["text"] for ln in src.get("lines") or []
+                                if isinstance(ln, dict) and ln.get("kind") == "deprecating" and isinstance(ln.get("text"), str))
+                if not found(dep):
+                    problems.append(f"deadline 근거 없음: {name}의 deadline {dl}이(가) 원문의 deprecating 줄(지원 종료 · 제거)에 없습니다 — deadline을 null로 두세요.")
+            elif it.get("category") != "deprecating":
+                problems.append(f"deadline 쓰면 안 됨: {name}의 category가 deprecating이 아니라 deadline을 쓰지 않습니다 — deadline을 null로 두세요.")
+            elif not found(_source_text(src)):
+                problems.append(f"deadline 근거 없음: {name}의 deadline {dl}이(가) 원문(본문)에 연도까지 적혀 있지 않습니다 — deadline을 null로 두세요.")
+    return problems
+
+
+def validate_items(result, fetched, allow_dropped: bool = True):
+    """(전체 문제, 항목별 문제). 항목별 문제의 키는 (source, id).
+
+    allow_dropped=False(Claude가 쓴 결과를 --data-dir로 검사할 때)면 dropped가 하나라도 있으면 실패 — dropped는
+    --partial 확정 때 검사기만 쓴다. 그 항목은 items에 없으니 빠짐으로도 나온다."""
+    glob: list[str] = []
+    per: dict[tuple, list[str]] = {}
     if not isinstance(fetched, dict) or not isinstance(fetched.get("items"), list):
-        return ["가져온 파일의 형식이 이상합니다(items 배열 없음) — 다시 가져와야 합니다."]
+        return ["가져온 파일의 형식이 이상합니다(items 배열 없음) — 다시 가져와야 합니다."], per
     if not isinstance(result, dict):
-        return ["결과 파일 맨 바깥이 JSON 객체({ … })가 아닙니다."]
+        return ["결과 파일 맨 바깥이 JSON 객체({ … })가 아닙니다."], per
     items = result.get("items")
     if not isinstance(items, list):
-        return ["결과 파일에 items 배열이 없습니다."]
+        return ["결과 파일에 items 배열이 없습니다."], per
     if not isinstance(result.get("errors"), list):
-        problems.append("결과 파일에 errors 배열이 없습니다 — 가져온 파일의 errors를 그대로 넣으세요(없으면 []).")
+        glob.append("결과 파일에 errors 배열이 없습니다 — 가져온 파일의 errors를 그대로 넣으세요(없으면 []).")
     elif result["errors"] != fetched.get("errors", []):
-        problems.append("errors 다름: 결과의 errors가 가져온 파일의 errors와 다릅니다 — 보기 파일에 적힌 JSON을 그대로 넣으세요.")
+        glob.append("errors 다름: 결과의 errors가 가져온 파일의 errors와 다릅니다 — 보기 파일에 적힌 JSON을 그대로 넣으세요.")
+    dropped = result.get("dropped")
+    if dropped is None:
+        dropped = []
+    if not isinstance(dropped, list):
+        glob.append("dropped가 배열이 아닙니다 — [{source, id, reason}] 꼴이거나 없어야 합니다.")
+        dropped = []
+    if dropped and not allow_dropped:
+        glob.append("dropped 금지: dropped는 검사기가 씁니다 — 모든 소식을 items에 넣으세요(dropped 칸은 지우세요).")
+        dropped = []
+
+    args = result.get("args") if isinstance(result.get("args"), dict) else {}
+    fargs = fetched.get("args") if isinstance(fetched.get("args"), dict) else {}
+    depth = args.get("depth") or fargs.get("depth") or ""
 
     want = {}
     for it in fetched["items"]:
@@ -78,43 +247,50 @@ def validate(result, fetched) -> list[str]:
     got = set()
     for n, it in enumerate(items, 1):
         if not isinstance(it, dict):
-            problems.append(f"items의 {n}번째가 객체가 아닙니다.")
+            glob.append(f"items의 {n}번째가 객체가 아닙니다.")
             continue
         src, iid = it.get("source"), it.get("id")
         if not isinstance(src, str) or not isinstance(iid, str) or not src or not iid:
-            problems.append(f"items의 {n}번째에 source · id가 없습니다.")
+            glob.append(f"items의 {n}번째에 source · id가 없습니다.")
             continue
         key = (src, iid)
         name = _label(src, iid)
         if key in got:
-            problems.append(f"겹침: {name}이(가) 두 번 들어 있습니다.")
+            glob.append(f"겹침: {name}이(가) 두 번 들어 있습니다.")
             continue
         got.add(key)
         if key not in want:
-            problems.append(f"덧붙임: {name}은(는) 가져온 항목에 없습니다 — 빼세요.")
+            glob.append(f"덧붙임: {name}은(는) 가져온 항목에 없습니다 — 빼세요.")
             continue
-        src_item = want[key]
-        if it.get("link") != src_item.get("link"):
-            problems.append(f"링크 다름: {name}의 link가 가져온 값과 다릅니다 "
-                            f"(결과 {it.get('link')!r} / 가져온 것 {src_item.get('link')!r}).")
-        for field in ("title", "date"):
-            if field not in it:
-                problems.append(f"{field} 없음: {name}에 {field} 칸이 없습니다 — 가져온 값을 그대로 넣으세요.")
-            elif it[field] != src_item.get(field):
-                problems.append(f"{field} 다름: {name}의 {field}가 가져온 값과 다릅니다 "
-                                f"(결과 {it[field]!r} / 가져온 것 {src_item.get(field)!r}).")
-        if it.get("category") not in CATEGORIES:
-            problems.append(f"칸 틀림: {name}의 category가 {it.get('category')!r}입니다 "
-                            f"({' · '.join(CATEGORIES)} 중 하나).")
-        for field in ("brief", "detail"):
-            v = it.get(field)
-            if not isinstance(v, str) or not v.strip():
-                problems.append(f"빈 요약: {name}의 {field}가 비어 있습니다.")
+        found = check_item(it, want[key], depth)
+        if found:
+            per[key] = found
+
+    for n, d in enumerate(dropped, 1):
+        src, iid = (d.get("source"), d.get("id")) if isinstance(d, dict) else (None, None)
+        if not isinstance(src, str) or not isinstance(iid, str) or not src or not iid:
+            glob.append(f"dropped의 {n}번째에 source · id가 없습니다.")
+            continue
+        key = (src, iid)
+        name = _label(src, iid)
+        if key in got:
+            glob.append(f"겹침: {name}이(가) items와 dropped 양쪽에 있습니다 — 한쪽에만 두세요.")
+            continue
+        if key not in want:
+            glob.append(f"덧붙임: dropped의 {name}은(는) 가져온 항목에 없습니다 — 빼세요.")
+            continue
+        got.add(key)
 
     for key, src_item in want.items():
         if key not in got:
-            problems.append(f"빠짐: {_label(key[0], key[1], src_item.get('title'))}이(가) 결과에 없습니다.")
-    return problems
+            glob.append(f"빠짐: {_label(key[0], key[1], src_item.get('title'))}이(가) 결과에 없습니다.")
+    return glob, per
+
+
+def validate(result, fetched, allow_dropped: bool = True) -> list[str]:
+    """설계 5.4의 통과 조건. 문제 목록(비었으면 통과) = 전체 문제 + 항목별 문제."""
+    glob, per = validate_items(result, fetched, allow_dropped)
+    return glob + [p for ps in per.values() for p in ps]
 
 
 def report_fail(problems: list[str], result_path) -> None:
@@ -131,12 +307,14 @@ def write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
-def update_state(data_dir: Path, fetched: dict) -> dict:
+def update_state(data_dir: Path, fetched: dict, ids: dict[str, list[str]] | None = None, hold=()) -> dict:
     """처리한 ID를 소스별 seen 맨 앞에 넣고 최근 SEEN_KEEP개만 남긴다.
 
     그 소스의 기록이 처음이면 이번에 본 후보 전체(listed_ids)를 기준선으로 함께 넣는다 —
     그러지 않으면 limit 밖에 있던 옛 글이 다음 range=new에서 '새 것'으로 나온다.
     (후보는 소스마다 최신 50개라 SEEN_KEEP 200 안에 넉넉히 든다.)
+    ids를 주면 그 ID만 처리한 것으로 넣는다(항목 단위 확정). None이면 fetched의 항목 전부.
+    hold = 다음에 다시 시도할 (source, id) — 처음 기록하는 소스의 기준선에도 넣지 않는다(넣으면 다시 나오지 않는다).
     """
     path = data_dir / "state.json"
     state = {}
@@ -151,16 +329,22 @@ def update_state(data_dir: Path, fetched: dict) -> dict:
             print(f"경고: state.json이 깨져 {broken.name}로 옮기고 새로 시작합니다({e}).", file=sys.stderr)
             state = {}
     new_ids: dict[str, list[str]] = {}
-    for it in fetched.get("items", []):
-        src, iid = it.get("source"), it.get("id")
-        if src and iid and iid not in new_ids.setdefault(src, []):
-            new_ids[src].append(iid)
+    if ids is None:
+        for it in fetched.get("items", []):
+            src, iid = it.get("source"), it.get("id")
+            if src and iid and iid not in new_ids.setdefault(src, []):
+                new_ids[src].append(iid)
+    else:
+        for src, lst in ids.items():
+            if lst:
+                new_ids[src] = list(dict.fromkeys(lst))
     listed = fetched.get("listed_ids") if isinstance(fetched.get("listed_ids"), dict) else {}
+    hold = set(hold)
     for src in list(new_ids) + [s for s in listed if s not in new_ids]:
         ids = new_ids.get(src, [])
         first = not isinstance(state.get(src), dict)
         if first:
-            old = [x for x in listed.get(src, []) if isinstance(x, str)]  # 기준선
+            old = [x for x in listed.get(src, []) if isinstance(x, str) and (src, x) not in hold]  # 기준선
         else:
             old = state[src].get("seen", [])
         if not ids and not first:
@@ -183,7 +367,8 @@ def is_work_dir(path: Path) -> bool:
         return False
 
 
-def commit(data_dir: Path, pending: dict, fetched: dict) -> list[str]:
+def commit(data_dir: Path, pending: dict, fetched: dict, ids: dict[str, list[str]] | None = None,
+           hold=()) -> list[str]:
     """통과한 리포트를 확정한다. 남긴 일들을 문장으로 돌려준다."""
     done = []
     result_path = Path(pending["result_path"])
@@ -203,7 +388,7 @@ def commit(data_dir: Path, pending: dict, fetched: dict) -> list[str]:
         shutil.copyfile(fetched_path, out / f"{stamp}.fetched.json")
         done.append(f"결과 사본: {out / (stamp + '.json')}")
     # 3) 상태 갱신
-    new_ids = update_state(data_dir, fetched)
+    new_ids = update_state(data_dir, fetched, ids, hold)
     if new_ids:
         done.append("기록 갱신: " + " · ".join(f"{s} {len(v)}개" for s, v in new_ids.items()))
     # 4) 대기 표시 지우기 — 그사이 새 가져오기가 덮어썼다면 남겨 둔다
@@ -218,12 +403,127 @@ def commit(data_dir: Path, pending: dict, fetched: dict) -> list[str]:
     return done
 
 
+MAX_ATTEMPTS = 3  # 같은 소식이 이만큼 걸리면 건너뛴다
+
+
+def _group(keys) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for src, iid in keys:
+        out.setdefault(src, []).append(iid)
+    return out
+
+
+def abandon_pending(pending: dict) -> None:
+    """대기 표시를 포기 표시(<세션>.abandoned.json)로 바꾼다."""
+    path = Path(pending["_path"])
+    try:
+        os.replace(path, path.with_name(path.stem + ".abandoned.json"))
+    except OSError:
+        pass
+
+
+def sanitize_partial(result, fetched):
+    """--partial에서만: 기계적으로 고칠 수 있는 짝 문제를 정리한다.
+
+    (정리한 결과, 빠진 항목 키 목록) — 구조가 틀렸으면 (None, []). errors는 가져온 파일 것으로 덮고,
+    가져온 파일에 없는 항목은 빼고, 겹친 것은 처음 하나만 두고, items에 없는 항목은 빠진 것으로 센다.
+    Claude가 쓴 dropped는 받지 않는다(dropped는 검사기 몫) — 그 항목도 빠진 것(걸린 것)으로 세어 다음에 다시 시도한다.
+    """
+    if not isinstance(result, dict) or not isinstance(fetched, dict) or not isinstance(fetched.get("items"), list) \
+            or not isinstance(result.get("items"), list) \
+            or not (result.get("dropped") is None or isinstance(result.get("dropped"), list)):
+        return None, []
+    want = {(it.get("source"), it.get("id")) for it in fetched["items"] if isinstance(it, dict)}
+    got: set = set()
+
+    def keep(e):
+        if not isinstance(e, dict):
+            return False
+        key = (e.get("source"), e.get("id"))
+        if key not in want or key in got:
+            return False
+        got.add(key)
+        return True
+
+    items = [e for e in result["items"] if keep(e)]
+    missing = [k for k in want if k not in got and isinstance(k[0], str) and isinstance(k[1], str)]
+    new = dict(result, items=items, errors=fetched.get("errors", []))
+    if "dropped" in result:
+        new["dropped"] = []
+    return new, missing
+
+
+def commit_partial(data_dir: Path, pending: dict, fetched: dict, result: dict, glob, per) -> int:
+    """걸린 소식만 빼고 확정한다. 걸릴 때마다 failed.json에 세고, 3번째면 건너뛰며 본 것으로 친다."""
+    failed_path = data_dir / "failed.json"
+    failed, _ = load_json(failed_path, "실패 기록") if failed_path.exists() else ({}, None)
+    if not isinstance(failed, dict):
+        failed = {}
+    counts, skipped, bad = {}, [], set(per)
+    for key, probs in per.items():
+        k = f"{key[0]}:{key[1]}"
+        n = (failed.get(k) if isinstance(failed.get(k), int) else 0) + 1
+        counts[key] = n
+        if n >= MAX_ATTEMPTS:
+            skipped.append(key)
+    passing = [it for it in result["items"] if (it.get("source"), it.get("id")) not in bad]
+    for it in passing:  # 이번에 통과한 것의 실패 기록은 지운다
+        failed.pop(f"{it.get('source')}:{it.get('id')}", None)
+    for key, n in counts.items():
+        k = f"{key[0]}:{key[1]}"
+        if key in skipped:
+            failed.pop(k, None)  # 건너뛴 것은 상태에 들어가므로 기록을 치운다
+        else:
+            failed[k] = n
+
+    if not passing and not skipped:
+        write_json(failed_path, failed)
+        abandon_pending(pending)
+        print("검사 실패 — 통과한 항목이 하나도 없어 확정하지 않고 포기 표시로 남깁니다.", file=sys.stderr)
+        report_fail([p for ps in per.values() for p in ps], pending["result_path"])
+        return 1
+    # 통과한 것이 없어도 이번에 건너뛴 것이 있으면 items: [] 짝을 확정한다 — 서버가 건너뜀을 운영 알림으로 알 수 있게
+
+    dropped = list(result.get("dropped") or [])
+    for key, probs in per.items():
+        reason = probs[0]
+        if key in skipped:
+            reason = f"건너뜀({MAX_ATTEMPTS}번 실패): {reason}"
+        dropped.append({"source": key[0], "id": key[1], "reason": reason, "attempt": counts[key]})
+    new_result = dict(result, items=passing, dropped=dropped)
+    # 다시 쓴 결과도 서버가 나중에 같은 짝으로 다시 검사하므로 스스로 통과해야 한다
+    again = validate(new_result, fetched)
+    if again:
+        report_fail(again, pending["result_path"])
+        return 1
+    result_path = Path(pending["result_path"])
+    tmp = result_path.with_name(result_path.name + ".tmp")
+    tmp.write_text(json.dumps(new_result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, result_path)
+
+    # 상태 = 통과한 것 + 건너뛴 것. 걸린 것(다시 시도)은 넣지 않는다 — 처음 기록하는 소스의 기준선에서도 뺀다
+    held = [k for k in bad if k not in skipped]
+    seen_ids = _group([(it["source"], it["id"]) for it in passing] + list(skipped))
+    try:
+        done = commit(data_dir, pending, fetched, seen_ids, hold=held)
+    except OSError as e:
+        print(f"검사는 통과했지만 기록하지 못했습니다: {e}", file=sys.stderr)
+        return 1
+    write_json(failed_path, failed)
+    head = f"일부만 확정 — 항목 {len(passing)}개 확정" if passing else "통과한 항목 없이 건너뜀만 확정"
+    print(f"{head}, 걸린 {len(bad)}개는 뺌"
+          f"(건너뜀 {len(skipped)}개, 다음에 다시 시도 {len(held)}개). " + " / ".join(done))
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="ai-news-check",
                                 description="ai-news-digest 결과 파일을 검사한다(통과 0 · 실패 1).")
     p.add_argument("--data-dir", help="플러그인 데이터 폴더 — 그 대화의 대기 표시가 가리키는 파일을 검사")
     p.add_argument("--session-id", help="Claude Code 세션 ID(--data-dir와 함께)")
     p.add_argument("--commit", action="store_true", help="통과하면 사본 · 기록 갱신 · 대기 표시 삭제")
+    p.add_argument("--partial", action="store_true",
+                   help="--commit과 함께: 걸린 항목만 빼고 통과한 항목을 확정(3번 걸리면 건너뜀)")
     p.add_argument("--result", help="결과 파일(검사만)")
     p.add_argument("--fetched", help="가져온 파일(검사만)")
     args = p.parse_args(argv)
@@ -262,7 +562,20 @@ def main(argv=None) -> int:
     if err:
         report_fail([err], result_path)
         return 1
-    problems = validate(result, fetched)
+    if args.partial and args.commit and pending is not None:
+        new, missing = sanitize_partial(result, fetched)
+        if new is not None:
+            # 빠진 것은 걸린 항목으로 세므로, 전체 문제 판정에서는 dropped에 있는 것처럼 본다
+            probe = dict(new, dropped=list(new.get("dropped") or [])
+                         + [{"source": k[0], "id": k[1], "reason": "빠짐"} for k in missing])
+            glob, per = validate_items(probe, fetched)
+            per = dict(per)
+            for key in missing:
+                per[key] = ["빠짐: 결과에 없음"]
+            if (per or new != result) and not glob:
+                return commit_partial(data_dir, pending, fetched, new, glob, per)
+    # 서버 재검사(--result/--fetched)는 확정된 결과 — 검사기가 쓴 dropped가 있을 수 있다
+    problems = validate(result, fetched, allow_dropped=pending is None)
     if problems:
         report_fail(problems, result_path)
         return 1
