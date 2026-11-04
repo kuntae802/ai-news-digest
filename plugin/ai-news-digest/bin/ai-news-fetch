@@ -37,7 +37,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 def _plugin_version() -> str:
     """플러그인 버전은 plugin.json 한 곳에서만 정한다."""
@@ -639,18 +639,99 @@ def parse_anthropic_list(html: str) -> list[dict]:
     return out  # 페이지 순서(최신순) 그대로
 
 
+ARTICLE_SCOPES = (("data-article-body", None), (None, "main"))                     # 글 페이지(Anthropic)
+SNAPSHOT_SCOPES = (("data-article-body", None), (None, "article"), (None, "main"))  # 아카이브 보관본(어느 회사든)
+WAYBACK_TOOLBAR_RE = re.compile(r"<!--\s*BEGIN WAYBACK TOOLBAR INSERT\s*-->.*?<!--\s*END WAYBACK TOOLBAR INSERT\s*-->",
+                                re.S | re.I)
+
+
+def _scoped_text(html: str, scopes) -> str:
+    """scopes 차례대로 그 요소 안의 글자를 뽑아, 200자를 넘는 첫 것. 모두 짧으면 가장 긴 것."""
+    best = ""
+    for attr, tag in scopes:
+        text = html_to_text(html, root_attr=attr, root_tag=tag)
+        if len(text) >= 200:
+            return text
+        if len(text) > len(best):
+            best = text
+    return best
+
+
 def extract_article_text(html: str) -> str:
     """Anthropic 글 페이지에서 본문 글자만. 본문 표시 속성이 없으면 <main> 전체에서."""
-    text = html_to_text(html, root_attr="data-article-body")
-    if len(text) < 200:
-        alt = html_to_text(html, root_tag="main")
-        if len(alt) > len(text):
-            text = alt
-    return clip(text)
+    return clip(_scoped_text(html, ARTICLE_SCOPES))
+
+
+def extract_snapshot_text(html: str) -> str:
+    """인터넷 아카이브 보관본(원래 HTML)에서 본문 글자만 — 보관소 도구 막대가 끼어 있으면 먼저 떼고,
+    본문 표시 속성 → <article> → <main> 차례로 좁힌다."""
+    return clip(_scoped_text(WAYBACK_TOOLBAR_RE.sub("", html or ""), SNAPSHOT_SCOPES))
+
+
+# Jina Reader 응답 = 머리 줄(Title: · URL Source: · Published Time: · Warning: …) + 'Markdown Content:' + 본문 마크다운
+JINA_MARK_RE = re.compile(r"^Markdown Content:[ \t]*$", re.M)
+JINA_HEAD_RE = re.compile(r"^(Title|URL Source|Published Time|Description|Warning|Number of Pages):")
+JINA_BAD_WARNING_RE = re.compile(r"^Warning:.*(returned error \d{3}|captcha)", re.M | re.I)
+
+
+class BodyMiss(Exception):
+    """받기는 했지만 쓸 본문이 아님(보관본 없음 · 대상 페이지 오류 경고) — 요청 오류는 아니다."""
+
+
+def _markdown_to_text(md: str) -> str:
+    """마크다운을 읽을 글자로 — 그림은 빼고 링크는 글자만, 제목 표시 · 굵게는 떼고 목록 머리표는 '- '로."""
+    md = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", md)                          # 그림
+    md = re.sub(r"\[([^\]]*)\]\([^)\s]*(?:\s+\"[^\"]*\")?\)", r"\1", md)   # 링크 → 글자
+    out = []
+    for raw in md.splitlines():
+        line = raw.strip()
+        if re.fullmatch(r"(=+|-{3,}|\*{3,}|_{3,})", line):                 # 밑줄 제목 표시 · 가로줄
+            continue
+        line = re.sub(r"^#{1,6}\s+", "", line)
+        line = re.sub(r"^[*+-]\s+", "- ", line)
+        line = re.sub(r"^>\s?", "", line)
+        line = re.sub(r"\*\*([^*\n]+)\*\*|__([^_\n]+)__", lambda m: m.group(1) or m.group(2), line)
+        line = re.sub(r"\\([\\`*_{}\[\]()#+\-.!>~|=])", r"\1", line)   # 마크다운 이스케이프(\_ · \- …)를 푼다
+        line = re.sub(r"\s+", " ", line).strip()
+        if line and line != "-":
+            out.append(line)
+    return "\n".join(out)
+
+
+def _from_title(text: str, title: str) -> str:
+    """본문 줄 가운데 글 제목과 같은 줄이 있으면 그 줄부터 — 앞에 붙은 사이트 메뉴를 떼어 낸다. 없으면 그대로."""
+    want = re.sub(r"\s+", " ", title or "").strip().casefold()
+    if not want:
+        return text
+    lines = text.splitlines()
+    for k, line in enumerate(lines):
+        if line.casefold() == want:
+            return "\n".join(lines[k:])
+    return text
+
+
+def jina_text(raw: str, title: str = "") -> str:
+    """Jina Reader 응답 → 본문 글자. 머리 줄 묶음은 떼고, 대상 페이지 오류 · 확인 화면 경고가 있으면 BodyMiss."""
+    m = JINA_MARK_RE.search(raw or "")
+    if m:
+        head, body = raw[:m.start()], raw[m.end():]
+    else:                                   # 표시 줄이 없으면 앞쪽 머리 줄만 걷어 낸다
+        if re.match(r"\s*<(!doctype|html)\b", raw or "", re.I):
+            raise BodyMiss("마크다운이 아니라 HTML 응답")
+        lines = (raw or "").splitlines()
+        k = 0
+        while k < len(lines) and (not lines[k].strip() or JINA_HEAD_RE.match(lines[k])):
+            k += 1
+        head, body = "\n".join(lines[:k]), "\n".join(lines[k:])
+    bad = JINA_BAD_WARNING_RE.search(head)
+    if bad:
+        raise BodyMiss(f"대상 페이지 오류 경고({bad.group(1)})")
+    return clip(_from_title(_markdown_to_text(body), title))
 
 
 def parse_openai(data: bytes) -> list[dict]:
-    """OpenAI 뉴스 RSS. 소개문(description)이 본문, category가 원문 표시. id = 글 주소 경로."""
+    """OpenAI 뉴스 RSS. 소개문(description)을 우선 본문으로(고른 글은 fill_bodies가 본문으로 바꿔 본다),
+    category가 원문 표시. id = 글 주소 경로."""
     root = ET.fromstring(data)
     channel = root.find("channel")
     if channel is None:
@@ -705,22 +786,92 @@ def list_openai(client):
     return parse_openai(client.get(OPENAI_RSS))[:LIST_WINDOW]
 
 
-def fill_anthropic_bodies(client, picked, errors):
-    """고른 글만 글 페이지를 받아 본문을 채운다. 글 페이지를 받지 못했거나 본문이 비면 목록 소개문을 그대로 두고
-    body_kind를 intro(소개문만)로 바꾼다 — 해설(왜 중요한가 · 챙길 것 · 배경)을 쓸 근거가 없다."""
+# ---------------------------------------------------------------- 뉴스 본문 채우기
+# 고른 글만 본문을 받는다. 길 차례(BODY_CHAINS)대로 해 보고 처음 된 길을 body_via로 남긴다.
+# OpenAI 글 페이지는 프로그램 요청에 Cloudflare 확인 화면(403)을 돌려준다(robots.txt는 Allow: /) — 적은 양을
+# 공개 읽기 서비스(Jina Reader) · 인터넷 아카이브 보관본으로 받는 것은 괜찮다고 사용자가 정했다(2026-11-04).
+
+JINA_READER = "https://r.jina.ai/"
+WAYBACK_AVAILABLE = "https://archive.org/wayback/available?url="
+WAYBACK_RAW = "https://web.archive.org/web/{ts}id_/{url}"   # id_ = 보관소가 손대지 않은 원래 HTML
+MIN_ARTICLE_CHARS = 400     # 이보다 짧으면 본문을 받지 못한 것으로 보고 다음 길로
+BODY_CHAINS = {"anthropic-news": ("direct", "jina", "archive"), "openai-news": ("jina", "archive")}
+BODY_VIA_NAMES = {"direct": "글 페이지", "jina": "공개 읽기 서비스(r.jina.ai)", "archive": "인터넷 아카이브"}
+BODY_VIA_VIEW = {"jina": "공개 읽기 서비스(r.jina.ai)로 받음", "archive": "인터넷 아카이브 보관본으로 받음"}
+INTRO_NAMES = {"anthropic-news": "목록 소개문", "openai-news": "피드 소개문"}
+PUBLIC_VIA_HOSTS = {"openai.com", "www.openai.com", "anthropic.com", "www.anthropic.com"}   # 공개 서비스에 넘기는 주소
+
+
+def _public_link(item) -> str:
+    """공개 서비스(Jina · 아카이브)에 넘길 글 주소 — https이고 두 회사 주소일 때만. 아니면 그 길을 건너뛴다(BodyMiss)."""
+    link = item.get("link") or ""
+    u = urlparse(link)
+    if u.scheme != "https" or (u.hostname or "") not in PUBLIC_VIA_HOSTS:
+        raise BodyMiss("공개 서비스로 넘기지 않는 주소")
+    return link
+
+
+def body_direct(client, item) -> str:
+    return extract_article_text(client.get(item["link"]).decode("utf-8", "replace"))
+
+
+def body_jina(client, item) -> str:
+    raw = client.get(JINA_READER + _public_link(item)).decode("utf-8", "replace")
+    return jina_text(raw, item.get("title") or "")
+
+
+def body_archive(client, item) -> str:
+    """보관본이 있고(available) 보관할 때 응답이 200이었을 때만 그 원래 HTML을 받아 본문을 뽑는다."""
+    link = _public_link(item)
+    meta = json.loads(client.get(WAYBACK_AVAILABLE + quote(link, safe="")))
+    snap = (meta.get("archived_snapshots") or {}).get("closest") if isinstance(meta, dict) else None
+    if not isinstance(snap, dict) or snap.get("available") is not True:
+        raise BodyMiss("보관본 없음")
+    if str(snap.get("status")) != "200":
+        raise BodyMiss(f"보관본 응답 {snap.get('status')}")
+    ts = str(snap.get("timestamp") or "")
+    if not re.fullmatch(r"\d{14}", ts):
+        raise BodyMiss("보관 시각을 읽지 못함")
+    html = client.get(WAYBACK_RAW.format(ts=ts, url=link)).decode("utf-8", "replace")
+    return extract_snapshot_text(html)
+
+
+BODY_STEPS = {"direct": body_direct, "jina": body_jina, "archive": body_archive}
+
+
+def fill_bodies(client, source, picked, errors):
+    """고른 글마다 BODY_CHAINS[source] 차례로 본문을 받아 본다. 된 길이 있으면 body = 그 본문 · body_kind =
+    article · body_via = 그 길. 모두 안 되면 목록 · 피드 소개문을 그대로 두고 body_kind = intro · body_via = None —
+    해설(왜 중요한가 · 챙길 것 · 배경)을 쓸 근거가 없다. 요청 오류가 하나라도 있었으면 errors에 한 줄 남긴다
+    (보관본 없음 · 너무 짧음은 요청 오류가 아니라 남기지 않는다)."""
     for item in picked:
-        try:
-            page = client.get(item["link"]).decode("utf-8", "replace")
-        except FetchError as e:
-            errors.append({"source": "anthropic-news", "kind": e.kind,
-                           "message": f"글 페이지를 받지 못해 목록 소개문으로 대신함: {e.message}"})
-            item["body_kind"] = "intro"
-            continue
-        body = extract_article_text(page)
-        if body:
-            item["body"] = body
+        tried, failed_kinds = [], []
+        for via in BODY_CHAINS[source]:
+            try:
+                text = BODY_STEPS[via](client, item)
+            except FetchError as e:
+                tried.append(f"{BODY_VIA_NAMES[via]} {e.message}")
+                failed_kinds.append(e.kind)
+                continue
+            except BodyMiss as e:
+                tried.append(f"{BODY_VIA_NAMES[via]} {e}")
+                continue
+            except (ValueError, TypeError, AttributeError, UnicodeDecodeError) as e:
+                tried.append(f"{BODY_VIA_NAMES[via]} 응답을 읽지 못함: {e}")
+                failed_kinds.append("permanent")
+                continue
+            if len(text) < MIN_ARTICLE_CHARS:
+                tried.append(f"{BODY_VIA_NAMES[via]} 본문이 짧음({len(text)}자)")
+                continue
+            item.update(body=text, body_kind="article", body_via=via)
+            break
         else:
-            item["body_kind"] = "intro"
+            item.update(body_kind="intro", body_via=None)
+            if failed_kinds:
+                errors.append({"source": source,
+                               "kind": "temporary" if "temporary" in failed_kinds else "permanent",
+                               "message": f"글 본문을 받지 못해 {INTRO_NAMES[source]}으로 대신함: "
+                                          + " · ".join(tried)})
 
 
 LISTERS = {
@@ -729,7 +880,6 @@ LISTERS = {
     "anthropic-news": list_anthropic,
     "openai-news": list_openai,
 }
-FILLERS = {"anthropic-news": fill_anthropic_bodies}
 
 SOURCE_NAMES = {"claude-code": "Claude Code", "codex": "Codex",
                 "anthropic-news": "Anthropic 뉴스", "openai-news": "OpenAI 뉴스"}
@@ -979,6 +1129,8 @@ def write_view(path: Path, fetched: dict, result_path: Path, backlog: dict) -> N
         for key in ("source", "id", "title", "link", "date"):
             lines.append(f"- {key}: {json.dumps(it[key], ensure_ascii=False)}")
         lines.append(f"- body_kind: {it.get('body_kind', 'article')}")
+        if it.get("body_via") in BODY_VIA_VIEW:
+            lines.append(f"- 본문: {BODY_VIA_VIEW[it['body_via']]}")
         lines += [f"- 원문 표시(참고): {it['source_label'] or '없음'}", ""]
         kind = it.get("body_kind")
         if kind == "release" and it.get("lines") is not None:
@@ -1103,8 +1255,8 @@ def main(argv=None, client=None, now=None) -> int:
             continue
         # range=new라도 그 소스 기록이 처음이면 None → recent처럼
         picked, left = select(candidates, args.limit, seen_by_source.get(source))
-        if source in FILLERS:
-            FILLERS[source](client, picked, errors)
+        if source in BODY_CHAINS:
+            fill_bodies(client, source, picked, errors)
         listed[source] = [it["id"] for it in candidates]
         counts[source] = len(picked)
         if left:
